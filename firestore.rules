@@ -1,0 +1,70 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function memberPath(uid) { return /databases/$(database)/documents/members/$(uid); }
+    function variantPath(sku) { return /databases/$(database)/documents/variants/$(sku); }
+    function eventPath(id) { return /databases/$(database)/documents/history/$(id); }
+    function allowed(roles) {
+      return request.auth != null && exists(memberPath(request.auth.uid))
+        && get(memberPath(request.auth.uid)).data.role in roles;
+    }
+    function reader() { return allowed(['reader', 'editor', 'admin']); }
+    function writer() { return allowed(['editor', 'admin']); }
+    function admin() { return allowed(['admin']); }
+    function shortString(value, min, max) { return value is string && value.size() >= min && value.size() <= max; }
+    function quantity(value) { return value is int && value >= 0 && value <= 1000000000; }
+    function money(value) { return value is int && value >= 0 && value <= 100000000000; }
+    function validVariant(data, sku) {
+      let keys = ['sku','name','size','color','photo','purchase','retail','office','warehouse','lastEvent'];
+      return data.keys().hasAll(keys) && data.keys().hasOnly(keys)
+        && data.sku == sku && sku.matches('^[A-Z0-9][A-Z0-9._-]{0,63}$')
+        && shortString(data.name, 1, 120) && shortString(data.color, 1, 60) && shortString(data.size, 1, 30)
+        && shortString(data.photo, 0, 1500)
+        && (data.photo == '' || data.photo.matches('^https://res[.]cloudinary[.]com/[A-Za-z0-9_-]+/image/upload/.+$'))
+        && money(data.purchase) && money(data.retail) && quantity(data.office) && quantity(data.warehouse)
+        && shortString(data.lastEvent, 20, 20);
+    }
+    function validTransition(event) {
+      let changed = event.after.diff(event.before).affectedKeys();
+      return (event.action == 'edit' && changed.hasOnly(['name','size','color','photo','purchase','retail','lastEvent']))
+        || (event.action == 'adjust' && (changed.hasOnly(['office','lastEvent']) && changed.hasAny(['office'])
+          || changed.hasOnly(['warehouse','lastEvent']) && changed.hasAny(['warehouse'])))
+        || (event.action == 'transfer' && changed.hasOnly(['office','warehouse','lastEvent'])
+          && changed.hasAll(['office','warehouse'])
+          && event.before.office + event.before.warehouse == event.after.office + event.after.warehouse);
+    }
+    function recorded(sku, before) {
+      let after = request.resource.data;
+      let path = eventPath(after.lastEvent);
+      let event = getAfter(path).data;
+      return !exists(path) && event.sku == sku && event.before == before && event.after == after;
+    }
+    match /members/{uid} {
+      allow get: if request.auth != null && (uid == request.auth.uid || admin());
+      allow list: if admin();
+      allow create, update: if admin() && uid != request.auth.uid
+        && request.resource.data.keys().hasOnly(['role'])
+        && request.resource.data.role in ['admin','editor','reader'];
+      allow delete: if admin() && uid != request.auth.uid;
+    }
+    match /variants/{sku} {
+      allow read: if reader();
+      allow create: if writer() && validVariant(request.resource.data, sku) && recorded(sku, null);
+      allow update: if writer() && validVariant(request.resource.data, sku) && recorded(sku, resource.data);
+    }
+    match /history/{id} {
+      allow read: if reader();
+      allow create: if writer() && validEvent(request.resource.data, id);
+    }
+    function validEvent(event, id) {
+      let path = variantPath(event.sku);
+      let keys = ['sku','action','before','after','note','actor','at'];
+      return event.keys().hasAll(keys) && event.keys().hasOnly(keys)
+        && event.actor == request.auth.uid && event.at == request.time
+        && shortString(event.note, 0, 300) && event.after.lastEvent == id
+        && getAfter(path).data == event.after
+        && (event.action == 'create' && !exists(path) && event.before == null
+          || exists(path) && get(path).data == event.before && event.before.lastEvent != id && validTransition(event));
+    }
+  }
+}
